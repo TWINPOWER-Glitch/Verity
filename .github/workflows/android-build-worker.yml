@@ -1,0 +1,540 @@
+name: Verity Android CI, APK Tests and Releases
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths:
+      - "app/**"
+      - "gradle/**"
+      - "buildSrc/**"
+      - "*.gradle"
+      - "*.gradle.kts"
+      - "gradle.properties"
+      - ".github/workflows/verity-build-check.yml"
+
+  pull_request:
+    paths:
+      - "app/**"
+      - "gradle/**"
+      - "buildSrc/**"
+      - "*.gradle"
+      - "*.gradle.kts"
+      - "gradle.properties"
+      - ".github/workflows/verity-build-check.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verity-app-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test and Build Android APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    outputs:
+      version_name: ${{ steps.version.outputs.version_name }}
+      version_code: ${{ steps.version.outputs.version_code }}
+      artifact_name: ${{ steps.version.outputs.artifact_name }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.13 with caching
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Verify Gradle installation
+        run: gradle --version
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: true
+          packages: platform-tools
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sdkmanager \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+
+      - name: Read application version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION_NAME=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)
+          VERSION_CODE=$(grep -oP 'versionCode = \K[0-9]+' app/build.gradle.kts)
+
+          test -n "$VERSION_NAME"
+          test -n "$VERSION_CODE"
+
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=verity-apks-v$VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXPECTED="v${{ steps.version.outputs.version_name }}"
+          ACTUAL="${GITHUB_REF_NAME}"
+
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "Tag $ACTUAL does not match app version $EXPECTED"
+            exit 1
+          fi
+
+      # One Gradle invocation allows Gradle to reuse its task graph,
+      # configuration and daemon across all required build checks.
+      # All production Kotlin files remain included in compilation.
+      - name: Run unit tests, lint and build APKs
+        run: |
+          gradle \
+            --build-cache \
+            --parallel \
+            testDebugUnitTest \
+            lintDebug \
+            assembleDebug \
+            assembleRelease
+
+      - name: Validate APK outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEBUG_APK="app/build/outputs/apk/debug/app-debug.apk"
+          RELEASE_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+
+          test -s "$DEBUG_APK"
+          test -s "$RELEASE_APK"
+
+          unzip -t "$DEBUG_APK"
+          unzip -t "$RELEASE_APK"
+
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" \
+            dump badging "$DEBUG_APK" > debug-badging.txt
+
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" \
+            dump badging "$RELEASE_APK" > release-badging.txt
+
+          head -n 5 debug-badging.txt
+          head -n 5 release-badging.txt
+
+          echo "Both APK archives passed validation."
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.artifact_name }}
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verity-lint-report
+          path: app/build/reports/lint-results-debug.html
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload unit test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verity-unit-test-reports
+          path: app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  apk-smoke-test:
+    name: Install, Launch and Inspect Verity UI
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: apks
+
+      - name: Locate debug APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK=$(find apks -name "app-debug.apk" -print -quit)
+
+          test -n "$APK"
+          test -s "$APK"
+
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Enable KVM hardware acceleration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -e /dev/kvm ]; then
+            echo "KVM device is unavailable."
+            exit 1
+          fi
+
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm
+
+          ls -l /dev/kvm
+
+      - name: Restore Android Virtual Device cache
+        id: avd-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/avd
+          key: verity-avd-${{ runner.os }}-api35-google-apis-x86_64-pixel2-v3
+
+      - name: Prepare emulator smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p smoke-test-results
+
+          cat > smoke-test.sh <<'SMOKE_TEST'
+          #!/bin/bash
+
+          set -u
+
+          APK_PATH="${1:?APK path missing}"
+          RESULTS="smoke-test-results"
+
+          mkdir -p "$RESULTS"
+
+          capture_diagnostics() {
+            TEST_EXIT_CODE=$?
+            trap - EXIT
+
+            echo "Capturing emulator diagnostics before cleanup..."
+
+            timeout 20s adb devices -l \
+              > "$RESULTS/adb-devices.txt" 2>&1 || true
+
+            timeout 30s adb logcat -d -t 5000 \
+              > "$RESULTS/logcat.txt" 2>&1 || true
+
+            timeout 20s adb shell dumpsys activity activities \
+              > "$RESULTS/activities.txt" 2>&1 || true
+
+            timeout 20s adb shell dumpsys window windows \
+              > "$RESULTS/windows.txt" 2>&1 || true
+
+            timeout 20s adb shell pidof com.example.verity \
+              > "$RESULTS/process-id.txt" 2>&1 || true
+
+            timeout 20s adb exec-out screencap -p \
+              > "$RESULTS/verity-screen.png" 2>/dev/null || true
+
+            timeout 20s adb shell uiautomator dump \
+              /sdcard/verity-main-screen.xml \
+              > "$RESULTS/uiautomator-dump.txt" 2>&1 || true
+
+            adb pull /sdcard/verity-main-screen.xml \
+              "$RESULTS/main-screen.xml" \
+              > /dev/null 2>&1 || true
+
+            echo "Diagnostics capture completed."
+
+            echo "Cleaning up Verity after diagnostics..."
+
+            timeout 20s adb shell am force-stop com.example.verity \
+              > "$RESULTS/cleanup-force-stop.txt" 2>&1 || true
+
+            timeout 30s adb uninstall com.example.verity \
+              > "$RESULTS/cleanup-uninstall.txt" 2>&1 || true
+
+            return "$TEST_EXIT_CODE"
+          }
+
+          trap capture_diagnostics EXIT
+
+          if [ ! -s "$APK_PATH" ]; then
+            echo "APK is missing."
+            exit 1
+          fi
+
+          echo "Waiting for Android device..."
+          adb wait-for-device
+
+          echo "Installing Verity..."
+          adb install -r "$APK_PATH"
+
+          adb shell am force-stop com.example.verity || true
+
+          echo "Launching main activity..."
+
+          adb shell am start -W \
+            -n com.example.verity/.MainActivity
+
+          # Wait for the app process instead of using a fixed sleep.
+          PID=""
+          for attempt in $(seq 1 30); do
+            PID="$(adb shell pidof com.example.verity | tr -d '\r\n')"
+
+            if [ -n "$PID" ]; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$PID" ]; then
+            echo "Verity process is not running."
+            exit 1
+          fi
+
+          echo "Verity process running: $PID"
+
+          # Allow Compose to finish rendering before inspecting the UI.
+          adb shell uiautomator dump \
+            /sdcard/verity-main-screen.xml
+
+          adb pull /sdcard/verity-main-screen.xml \
+            "$RESULTS/main-screen.xml"
+
+          UI="$RESULTS/main-screen.xml"
+
+          for EXPECTED in \
+            'Verity' \
+            'generator-related traces' \
+            'Choose media' \
+            'Choose media to begin.'
+          do
+            if ! grep -Fq "$EXPECTED" "$UI"; then
+              echo "Expected UI text missing: $EXPECTED"
+              exit 1
+            fi
+          done
+
+          adb shell dumpsys activity activities \
+            > "$RESULTS/activities.txt"
+
+          if ! grep -Fq 'MainActivity' "$RESULTS/activities.txt"; then
+            echo "Main activity was not found."
+            exit 1
+          fi
+
+          echo "Verity main screen UI verified."
+          echo "Smoke test passed. Diagnostics will be captured before cleanup by the EXIT trap."
+          SMOKE_TEST
+
+          chmod +x smoke-test.sh
+
+      - name: Install, launch and inspect Verity
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          avd-name: verity-api-35
+          force-avd-creation: false
+          emulator-boot-timeout: 300
+          disable-linux-hw-accel: false
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: bash smoke-test.sh "${{ steps.apk.outputs.path }}"
+
+      - name: Analyse emulator diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          RESULTS="smoke-test-results"
+          mkdir -p "$RESULTS"
+
+          REPORT="$RESULTS/diagnostics-summary.md"
+          CRASHES="$RESULTS/crash-signatures.txt"
+
+          STATUS="PASS"
+          FINDINGS=0
+
+          {
+            echo "# Verity emulator diagnostics"
+            echo
+            echo "Run: $GITHUB_RUN_NUMBER"
+            echo "Commit: $GITHUB_SHA"
+            echo "Runner: $RUNNER_OS"
+            echo
+            echo "## Automated checks"
+          } > "$REPORT"
+
+          check_file() {
+            LABEL="$1"
+            FILE="$2"
+            PATTERN="$3"
+
+            if [ -s "$FILE" ] && grep -Fq "$PATTERN" "$FILE"; then
+              echo "- PASS — $LABEL" >> "$REPORT"
+            else
+              echo "- WARNING — $LABEL" >> "$REPORT"
+              STATUS="WARNING"
+              FINDINGS=$((FINDINGS + 1))
+            fi
+          }
+
+          check_file "ADB device detected" \
+            "$RESULTS/adb-devices.txt" "device"
+
+          if [ -s "$RESULTS/process-id.txt" ] &&
+             grep -Eq '[0-9]+' "$RESULTS/process-id.txt"; then
+            echo "- PASS — Verity process ID recorded" >> "$REPORT"
+          else
+            echo "- WARNING — Verity process ID unavailable" >> "$REPORT"
+            STATUS="WARNING"
+            FINDINGS=$((FINDINGS + 1))
+          fi
+
+          check_file "Launcher activity recorded" \
+            "$RESULTS/activities.txt" "MainActivity"
+
+          check_file "Main screen UI captured" \
+            "$RESULTS/main-screen.xml" "Choose media"
+
+          if [ -s "$RESULTS/verity-screen.png" ]; then
+            echo "- PASS — Emulator screenshot captured" >> "$REPORT"
+          else
+            echo "- WARNING — Emulator screenshot unavailable" >> "$REPORT"
+            STATUS="WARNING"
+            FINDINGS=$((FINDINGS + 1))
+          fi
+
+          echo >> "$REPORT"
+          echo "## Crash and ANR scan" >> "$REPORT"
+
+          : > "$CRASHES"
+
+          if [ -s "$RESULTS/logcat.txt" ]; then
+            grep -nEi \
+              'FATAL EXCEPTION|Fatal signal|ANR in .*com\.example\.verity|Process: com\.example\.verity' \
+              "$RESULTS/logcat.txt" > "$CRASHES" || true
+
+            if [ -s "$CRASHES" ]; then
+              echo "- WARNING — Potential Verity crash or ANR signatures found." >> "$REPORT"
+              echo >> "$REPORT"
+              echo '```text' >> "$REPORT"
+              head -n 60 "$CRASHES" >> "$REPORT"
+              echo '```' >> "$REPORT"
+
+              STATUS="WARNING"
+              FINDINGS=$((FINDINGS + 1))
+            else
+              echo "- PASS — No matching Verity crash signatures detected." >> "$REPORT"
+            fi
+          else
+            echo "- WARNING — Logcat unavailable; crash scan incomplete." >> "$REPORT"
+            STATUS="WARNING"
+            FINDINGS=$((FINDINGS + 1))
+          fi
+
+          {
+            echo
+            echo "## Result"
+            echo
+            echo "**$STATUS** — $FINDINGS diagnostic warning(s)."
+            echo
+            echo "The report analyses captured emulator evidence."
+            echo "A missing diagnostic file does not automatically indicate an application crash."
+          } >> "$REPORT"
+
+          cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload emulator diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verity-emulator-diagnostics
+          path: smoke-test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+  release:
+    name: Publish Versioned GitHub Release
+    needs:
+      - build
+      - apk-smoke-test
+
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: release-apks
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Verity v${{ needs.build.outputs.version_name }}
+          generate_release_notes: true
+          files: |
+            release-apks/debug/app-debug.apk
+            release-apks/release/app-release-unsigned.apk
+          body: |
+            ## Verity v${{ needs.build.outputs.version_name }}
+
+            Version code: ${{ needs.build.outputs.version_code }}
+
+            Automated checks completed:
+            - Unit tests
+            - Android lint
+            - Debug APK build
+            - Release APK build
+            - APK archive validation
+            - Android emulator installation
+            - Launcher activity verification
+            - Main screen inspection
+
+            Note: The release APK is unsigned.
+            The debug APK is signed with the Android debug key
+            and is intended for testing.

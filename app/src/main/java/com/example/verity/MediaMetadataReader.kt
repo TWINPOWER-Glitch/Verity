@@ -46,8 +46,6 @@ class MediaMetadataReader(private val resolver: ContentResolver) {
                     MediaMetadataRetriever.METADATA_KEY_AUTHOR,
                     MediaMetadataRetriever.METADATA_KEY_COMPOSER,
                     MediaMetadataRetriever.METADATA_KEY_WRITER,
-                    MediaMetadataRetriever.METADATA_KEY_COPYRIGHT,
-                    MediaMetadataRetriever.METADATA_KEY_DESCRIPTION,
                     MediaMetadataRetriever.METADATA_KEY_GENRE,
                 ).mapNotNull { key ->
                     retriever.extractMetadata(key)?.takeIf(String::isNotBlank)?.let { key.toString() to it }
@@ -58,3 +56,4 @@ class MediaMetadataReader(private val resolver: ContentResolver) {
         }
     }
 }
+
